@@ -66,7 +66,7 @@ Vectorized database over MCP. SQLite for vectors. Powered by DuckDB + Lance.
 
 vxdb is an embedded vector database exposed as MCP tools. You talk to it like a SQL \
 database, but it understands semantic similarity via the NEAR() function and full-text \
-search via the SEARCH() function. Embeddings are computed server-side — you send text, \
+search via the SEARCH() function. Embeddings are computed in-process — you send text, \
 it handles vectorization.
 
 ## Tables & Schema
@@ -196,6 +196,75 @@ By filter:
 
 ### Cross-table analytics (via sql tool)
     sql("SELECT l.message, s.name FROM lance_ns.main.logs l JOIN lance_ns.main.services s ON l.service = s._id WHERE l.level = 'error'")
+
+## Advanced Patterns
+
+These patterns go beyond basic CRUD. They exploit the fact that you can create tables \
+on the fly, embed your own outputs, and JOIN across your own emergent schema.
+
+### Self-organizing memory
+
+You don't need a pre-designed schema. Create tables as you discover you need them:
+
+    create_table("context", {"content": "text:embed", "source": "string", "timestamp": "string"})
+    create_table("decisions", {"choice": "text:embed", "rationale": "string", "domain": "string"})
+    create_table("preferences", {"preference": "text:embed", "confidence": "string"})
+
+The schema is an emergent artifact of your workflow. Use the sql tool to query across \
+your own tables:
+
+    sql("SELECT d.choice, c.content FROM lance_ns.main.decisions d JOIN lance_ns.main.context c ON d.domain = c.source WHERE d.domain = 'architecture'")
+
+### Semantic caching
+
+Before making an expensive tool call, check if you've seen something similar:
+
+    query("SELECT * FROM cache WHERE NEAR(query, 'current request description', 3) ORDER BY _similarity DESC LIMIT 1")
+
+If _similarity > 0.9, use the cached result. Evict stale entries:
+
+    delete("cache", where="timestamp < '2025-01-01'")
+
+Semantic dedup: find and remove entries that are near-duplicates of newer ones.
+
+### Progressive knowledge distillation
+
+Build a hierarchy from raw material to conclusions:
+
+    insert("knowledge", [{"content": "raw text from source...", "level": "raw", "source": "paper.pdf", "parent": ""}])
+    -- later, after reading several raw chunks:
+    insert("knowledge", [{"content": "Synthesized summary of findings...", "level": "summary", "source": "synthesis", "parent": "raw-ids"}])
+    -- later still:
+    insert("knowledge", [{"content": "Key conclusion: ...", "level": "conclusion", "source": "distillation", "parent": "summary-ids"}])
+
+NEAR() across levels traces provenance: "what raw chunks informed this conclusion?"
+
+    query("SELECT * FROM knowledge WHERE level = 'raw' AND NEAR(content, 'the conclusion text', 10)")
+
+### Multi-agent shared state
+
+Two agents pointed at the same vxdb instance (sequentially) can leave each other \
+semantically-queryable messages. Agent A inserts findings:
+
+    insert("shared", [{"content": "Found that API X rate-limits at 100/min", "agent": "researcher", "task": "api-survey"}])
+
+Agent B queries for relevance to its task:
+
+    query("SELECT * FROM shared WHERE NEAR(content, 'API rate limits and throttling', 5)")
+
+Use source/agent columns for agent-scoped namespacing within shared storage.
+
+### Reflexive self-evaluation
+
+Log your own outputs with outcome metadata:
+
+    insert("outputs", [{"task": "code review", "output": "text:embed summary of what I produced", "feedback": "accepted", "confidence": "high"}])
+
+When facing a similar task, query for past performance:
+
+    query("SELECT * FROM outputs WHERE NEAR(output, 'current task description', 5) ORDER BY _similarity DESC")
+
+This builds few-shot retrieval from lived experience.
 
 ## CLI (non-MCP)
 
