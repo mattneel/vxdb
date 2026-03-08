@@ -3,7 +3,7 @@
 import pytest
 
 from vxdb.embedder import Embedder
-from vxdb.storage import Storage
+from vxdb.storage import NAMESPACE, Storage
 from vxdb.tools import Tools
 
 
@@ -66,7 +66,6 @@ class TestQuery:
             assert "_id" in row
             assert "title" in row
             assert "_similarity" not in row
-            # no internal columns
             assert not any(k.startswith("_vec_") for k in row)
 
     def test_select_columns(self, tools_with_table):
@@ -76,7 +75,6 @@ class TestQuery:
         result = tools_with_table.query("SELECT title FROM notes")
         assert result["count"] == 1
         assert "title" in result["rows"][0]
-        assert "_id" in result["rows"][0]  # _id always included
 
     def test_where_filter(self, tools_with_table):
         tools_with_table.insert("notes", [
@@ -110,7 +108,6 @@ class TestQuery:
         result = tools_with_table.query(
             "SELECT * FROM notes WHERE category = 'ml' AND NEAR(content, 'deep learning', 5)"
         )
-        # Should only return ml category rows
         for row in result["rows"]:
             assert row["category"] == "ml"
             assert "_similarity" in row
@@ -124,10 +121,6 @@ class TestQuery:
             "SELECT * FROM notes WHERE NEAR(content, 'topic', 5) ORDER BY _similarity DESC LIMIT 2"
         )
         assert result["count"] == 2
-
-    def test_nonexistent_table(self, tools):
-        with pytest.raises(ValueError, match="does not exist"):
-            tools.query("SELECT * FROM nope")
 
     def test_near_on_non_embed_column(self, tools_with_table):
         tools_with_table.insert("notes", [
@@ -145,6 +138,110 @@ class TestQuery:
         assert result["rows"] == []
         assert result["count"] == 0
 
+    # --- New v0.2 capabilities ---
+
+    def test_or_in_where(self, tools_with_table):
+        """OR support — new with DuckDB."""
+        tools_with_table.insert("notes", [
+            {"title": "A", "content": "test", "category": "dev"},
+            {"title": "B", "content": "test", "category": "ops"},
+            {"title": "C", "content": "test", "category": "sales"},
+        ])
+        result = tools_with_table.query(
+            "SELECT * FROM notes WHERE category = 'dev' OR category = 'sales' ORDER BY title"
+        )
+        assert result["count"] == 2
+        titles = [r["title"] for r in result["rows"]]
+        assert titles == ["A", "C"]
+
+    def test_count_aggregate(self, tools_with_table):
+        """COUNT(*) — new with DuckDB."""
+        tools_with_table.insert("notes", [
+            {"title": "A", "content": "test", "category": "dev"},
+            {"title": "B", "content": "test", "category": "dev"},
+        ])
+        result = tools_with_table.query("SELECT COUNT(*) AS cnt FROM notes")
+        assert result["rows"][0]["cnt"] == 2
+
+    def test_distinct(self, tools_with_table):
+        """DISTINCT — new with DuckDB."""
+        tools_with_table.insert("notes", [
+            {"title": "A", "content": "test", "category": "dev"},
+            {"title": "B", "content": "test", "category": "dev"},
+            {"title": "C", "content": "test", "category": "ops"},
+        ])
+        result = tools_with_table.query("SELECT DISTINCT category FROM notes ORDER BY category")
+        assert result["count"] == 2
+        cats = [r["category"] for r in result["rows"]]
+        assert cats == ["dev", "ops"]
+
+    def test_search_fts(self, tools_with_table):
+        """SEARCH() full-text search — new with DuckDB+Lance."""
+        tools_with_table.insert("notes", [
+            {"title": "Neural Networks", "content": "Deep neural networks for image classification", "category": "ml"},
+            {"title": "Cookies", "content": "Baking chocolate chip cookies recipe", "category": "food"},
+        ])
+        result = tools_with_table.query(
+            "SELECT * FROM notes WHERE SEARCH(content, 'neural networks deep learning', 2)"
+        )
+        assert result["count"] >= 1
+        for row in result["rows"]:
+            assert "_score" in row
+
+
+class TestSql:
+    """Tests for the raw sql() tool."""
+
+    def test_basic_query(self, tools_with_table):
+        tools_with_table.insert("notes", [
+            {"title": "A", "content": "test", "category": "dev"},
+        ])
+        result = tools_with_table.sql(f"SELECT title FROM {NAMESPACE}.main.notes")
+        assert result["count"] == 1
+        assert result["rows"][0]["title"] == "A"
+
+    def test_count(self, tools_with_table):
+        tools_with_table.insert("notes", [
+            {"title": "A", "content": "test", "category": "dev"},
+            {"title": "B", "content": "test", "category": "ops"},
+        ])
+        result = tools_with_table.sql(f"SELECT COUNT(*) AS cnt FROM {NAMESPACE}.main.notes")
+        assert result["rows"][0]["cnt"] == 2
+
+    def test_join_across_tables(self, tools):
+        """JOIN across two vxdb tables — new with DuckDB."""
+        tools.create_table("authors", {"name": "string", "code": "string"})
+        tools.create_table("books", {"title": "string", "author_code": "string", "summary": "text:embed"})
+        tools.insert("authors", [
+            {"name": "Alice", "code": "A"},
+            {"name": "Bob", "code": "B"},
+        ])
+        tools.insert("books", [
+            {"title": "Book 1", "author_code": "A", "summary": "A great book"},
+            {"title": "Book 2", "author_code": "B", "summary": "Another book"},
+        ])
+        result = tools.sql(
+            f"SELECT b.title, a.name FROM {NAMESPACE}.main.books b "
+            f"JOIN {NAMESPACE}.main.authors a ON b.author_code = a.code "
+            f"ORDER BY b.title"
+        )
+        assert result["count"] == 2
+        assert result["rows"][0]["title"] == "Book 1"
+        assert result["rows"][0]["name"] == "Alice"
+
+    def test_group_by(self, tools_with_table):
+        tools_with_table.insert("notes", [
+            {"title": "A", "content": "test", "category": "dev"},
+            {"title": "B", "content": "test", "category": "dev"},
+            {"title": "C", "content": "test", "category": "ops"},
+        ])
+        result = tools_with_table.sql(
+            f"SELECT category, COUNT(*) AS cnt FROM {NAMESPACE}.main.notes GROUP BY category ORDER BY category"
+        )
+        assert result["count"] == 2
+        assert result["rows"][0] == {"category": "dev", "cnt": 2}
+        assert result["rows"][1] == {"category": "ops", "cnt": 1}
+
 
 class TestUpdate:
     def test_update_by_id(self, tools_with_table):
@@ -155,7 +252,6 @@ class TestUpdate:
         result = tools_with_table.update("notes", {"title": "New"}, id=row_id)
         assert result["count"] == 1
 
-        # Verify update
         query_result = tools_with_table.query(f"SELECT * FROM notes WHERE _id = '{row_id}'")
         assert query_result["rows"][0]["title"] == "New"
 

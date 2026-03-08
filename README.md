@@ -1,8 +1,8 @@
 # vxdb
 
-A local vector store with a SQL-like interface, exposed over MCP.
+A local vector store with a SQL interface, exposed over MCP.
 
-Server-side embeddings via [fastembed](https://github.com/qdrant/fastembed), file-based storage via [LanceDB](https://lancedb.github.io/lancedb/), exposed through [FastMCP](https://gofastmcp.com). Zero config for the consuming agent — it just talks to a database that happens to understand similarity.
+Server-side embeddings via [fastembed](https://github.com/qdrant/fastembed), query engine via [DuckDB](https://duckdb.org/) + [Lance extension](https://lancedb.github.io/lance/integrations/duckdb.html), storage via [LanceDB](https://lancedb.github.io/lancedb/), exposed through [FastMCP](https://gofastmcp.com). Zero config for the consuming agent — it just talks to a database that happens to understand similarity.
 
 ## Why vxdb
 
@@ -13,8 +13,9 @@ Most agentic memory solutions are either too coupled (framework-specific) or too
 | Embedded (no server) | Yes | Yes | No (client-server) | No (client-server) | Yes |
 | MCP native | Yes | No | No | No | No |
 | Server-side embeddings | Yes | No (BYO vectors) | Yes | No (BYO vectors) | No (BYO vectors) |
-| SQL-like query language | Yes | Yes (SQLite ext) | No (Python API) | No (REST/gRPC) | No (Python API) |
-| Hybrid search (vector + filter) | Yes | Limited | Yes | Yes | Yes |
+| Full SQL query language | Yes (DuckDB) | Yes (SQLite ext) | No (Python API) | No (REST/gRPC) | No (Python API) |
+| Vector + full-text search | Yes | Limited | Yes | Yes | Yes |
+| JOINs, aggregations | Yes (via `sql` tool) | Yes | No | No | No |
 | Zero config | Yes | Yes | No (needs setup) | No (needs setup) | Yes |
 | Install | `uvx` one-liner | pip + compile | pip + server | Docker / pip + server | pip |
 | Framework coupling | None (MCP) | SQLite | Langchain-adjacent | Framework-agnostic | Python-only |
@@ -42,7 +43,7 @@ uvx --from git+https://github.com/mattneel/vxdb vxdb --db ./data
 
 ## MCP Tools
 
-Seven tools, mirroring SQLite's surface:
+Eight tools — seven for CRUD, one for raw SQL:
 
 ```python
 create_table("notes", {"title": "string", "content": "text:embed", "category": "string"})
@@ -52,10 +53,16 @@ insert("notes", [
     {"title": "Recipe", "content": "How to bake chocolate chip cookies", "category": "food"},
 ])
 
+# query — single-table, with NEAR()/SEARCH() sugar
 query("SELECT * FROM notes WHERE category = 'ml' AND NEAR(content, 'deep learning', 5) ORDER BY _similarity DESC LIMIT 10")
+query("SELECT * FROM notes WHERE SEARCH(content, 'neural networks', 5) ORDER BY _score DESC")
+query("SELECT DISTINCT category FROM notes ORDER BY category")
+query("SELECT category, COUNT(*) AS cnt FROM notes GROUP BY category")
+
+# sql — raw DuckDB SQL for JOINs, cross-table queries, analytics
+sql("SELECT n.title, c.name FROM lance_ns.main.notes n JOIN lance_ns.main.categories c ON n.cat_id = c._id")
 
 update("notes", {"category": "archive"}, id="some-uuid")
-
 delete("notes", where="category = 'archive'")
 list_tables()
 drop_table("notes")
@@ -74,6 +81,8 @@ vxdb --db ./data serve --transport sse
 vxdb --db ./data create-table notes '{"title": "string", "content": "text:embed", "category": "string"}'
 vxdb --db ./data insert notes '[{"title": "ML Paper", "content": "Transformers for NLP", "category": "ml"}]'
 vxdb --db ./data query "SELECT * FROM notes WHERE NEAR(content, 'deep learning', 5) ORDER BY _similarity DESC"
+vxdb --db ./data query "SELECT * FROM notes WHERE SEARCH(content, 'neural networks', 5) ORDER BY _score DESC"
+vxdb --db ./data sql "SELECT COUNT(*) FROM lance_ns.main.notes"
 vxdb --db ./data update notes '{"category": "archive"}' --id some-uuid
 vxdb --db ./data delete notes --where "category = 'archive'"
 vxdb --db ./data tables
@@ -82,55 +91,90 @@ vxdb --db ./data drop-table notes
 
 All commands output JSON to stdout. Logs go to stderr.
 
-## Query Dialect
+## Query Tools
 
-vxdb implements a subset of SQL. This is the complete grammar — anything not listed here is not supported.
+vxdb has two query tools. Use `query` for single-table work with semantic search sugar, and `sql` for anything more complex.
 
-### Grammar
+### `query` — single-table, with NEAR()/SEARCH()
+
+Full SQL with `NEAR()` and `SEARCH()` syntactic sugar. Operates on one table at a time.
+
+```sql
+-- Metadata queries (full SQL: OR, GROUP BY, DISTINCT, COUNT, subqueries)
+SELECT * FROM notes
+SELECT title, source FROM notes WHERE priority <= 2
+SELECT * FROM notes WHERE source = 'arxiv' OR source = 'blog' ORDER BY score DESC LIMIT 5
+SELECT category, COUNT(*) AS cnt FROM notes GROUP BY category
+SELECT DISTINCT category FROM notes
+
+-- Vector similarity search
+SELECT * FROM notes WHERE NEAR(content, 'transformer architecture', 10)
+SELECT title FROM notes WHERE source = 'arxiv' AND NEAR(content, 'language models', 5) ORDER BY _similarity DESC
+
+-- Full-text search
+SELECT * FROM notes WHERE SEARCH(content, 'neural network architecture', 5)
+SELECT title FROM notes WHERE SEARCH(content, 'attention', 3) ORDER BY _score DESC
+```
+
+**NEAR(column, 'text', k)** — semantic similarity search:
+- `column` must be a `text:embed` column
+- `text` is embedded server-side at query time
+- `k` nearest neighbors returned
+- `_similarity` virtual column (0-1, higher = more similar)
+
+**SEARCH(column, 'text', k)** — full-text search:
+- `column` can be any text column
+- Keyword-based search via Lance FTS
+- `k` results returned
+- `_score` virtual column (higher = more relevant)
+
+Rules:
+- One `NEAR()` or one `SEARCH()` per query (not both)
+- `_similarity` only exists with `NEAR()`, `_score` only exists with `SEARCH()`
+- For hybrid (vector + FTS), use the `sql` tool with `lance_hybrid_search()`
+
+### `sql` — raw DuckDB SQL
+
+For JOINs, cross-table queries, aggregations, and analytics. No `NEAR()`/`SEARCH()` sugar — use DuckDB's native Lance table functions directly.
+
+Tables are referenced as `lance_ns.main.<table_name>`.
+
+```sql
+SELECT COUNT(*) FROM lance_ns.main.notes
+SELECT n.title, c.name FROM lance_ns.main.notes n JOIN lance_ns.main.categories c ON n.cat_id = c._id
+SELECT category, COUNT(*) FROM lance_ns.main.notes GROUP BY category ORDER BY COUNT(*) DESC
+```
+
+## Architecture
 
 ```
-query     = SELECT columns FROM table [WHERE filters] [ORDER BY ordering] [LIMIT n]
-columns   = "*" | col1, col2, ...
-filters   = condition [AND condition]*
-condition = column op value | NEAR(column, 'text', k)
-op        = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN" | "LIKE"
-value     = 'string' | number | true | false | (val, val, ...)  -- for IN
-ordering  = column [ASC|DESC] [, column [ASC|DESC]]*
+Agent ──MCP──▶ FastMCP ──▶ Tools ──▶ rewriter ──▶ DuckDB (reads)
+                                  └──▶ LanceDB Python API (writes)
+                                                    │
+                                              Lance files on disk
 ```
 
-### Rules
+**Reads** go through DuckDB with the Lance extension. DuckDB provides the SQL parser, query planner, and execution engine. The rewriter transforms `NEAR()`/`SEARCH()` sugar into DuckDB-native `lance_vector_search()`/`lance_fts()` table functions.
 
-- **Keywords** are case-insensitive. Column names and table names are case-sensitive.
-- **Strings** are single-quoted. Escape quotes by doubling: `'it''s'`.
-- **AND** is the only logical combinator. No OR, no NOT, no parenthesized groups.
-- **NEAR(column, 'text', k)** is valid only in WHERE. It embeds `text` at query time and returns the `k` nearest rows by cosine similarity.
-- **`_similarity`** is a virtual column that exists in results only when NEAR() is present. You can ORDER BY it. Using `_similarity` without NEAR() is a parse error.
-- **One NEAR() per query.** Multiple NEAR() clauses are a parse error.
-- **NEAR() column must be `text:embed` type.** Using NEAR() on a string/int/etc column is an error.
-- **No JOINs, no subqueries, no GROUP BY, no HAVING, no UNION, no aliases.** One table per query.
-- **No arithmetic expressions.** `WHERE count > 5` works. `WHERE count + 1 > 5` does not.
-- **IN** takes a parenthesized list: `WHERE category IN ('a', 'b', 'c')`.
-- **LIKE** uses `%` wildcards: `WHERE title LIKE '%neural%'`.
-- **Empty results return `[]`**, not an error. "No matching data" is a valid answer.
+**Writes** (insert, update, delete, table lifecycle) go through the LanceDB Python API for reliability and performance.
+
+### Schema types
+
+| Type | Description |
+|------|-------------|
+| `string` | UTF-8 text |
+| `text` | Alias for string |
+| `text:embed` | Text + auto-embedded vector for NEAR() |
+| `int` | 64-bit integer |
+| `float` | 64-bit float |
+| `bool` | Boolean |
 
 ### What NEAR() actually does
 
 1. The search text is embedded using the server's model (default: `BAAI/bge-small-en-v1.5`, 384 dimensions).
-2. LanceDB performs an approximate nearest-neighbor search on the vector column, returning `k` candidates.
-3. Metadata filters (other WHERE clauses) are applied to narrow results.
+2. The rewriter transforms `NEAR(col, 'text', k)` into a `lance_vector_search()` call with the embedded vector.
+3. DuckDB executes the query, including any additional WHERE filters, ORDER BY, and LIMIT.
 4. Each result gets a `_similarity` score: `1 / (1 + distance)`, where distance is L2. Higher = more similar.
-5. Results are returned as JSON with all requested columns + `_similarity`.
-
-### Schema types
-
-| Type | Description | Arrow mapping |
-|------|-------------|---------------|
-| `string` | UTF-8 text | utf8 |
-| `text` | Alias for string | utf8 |
-| `text:embed` | Text + auto-embedded vector | utf8 + vector[dim] |
-| `int` | Integer | int64 |
-| `float` | Floating point | float64 |
-| `bool` | Boolean | bool |
 
 ## Demo
 
@@ -159,6 +203,15 @@ $ vxdb --db ./demo query \
     {"_id": "...", "title": "GPT-2", "year": 2019, "_similarity": 0.57}
 ], "count": 3}
 
+# Full-text search — keyword matching
+$ vxdb --db ./demo query \
+    "SELECT title FROM docs WHERE SEARCH(body, 'neural language model', 3) ORDER BY _score DESC" 2>/dev/null
+{"rows": [
+    {"_id": "...", "title": "Scaling Laws", "_score": 4.2},
+    {"_id": "...", "title": "BERT", "_score": 3.1},
+    {"_id": "...", "title": "GPT-2", "_score": 2.8}
+], "count": 3}
+
 # Hybrid search — vector + metadata filter
 $ vxdb --db ./demo query \
     "SELECT title FROM docs WHERE source = 'arxiv' AND NEAR(body, 'scaling compute', 5) ORDER BY _similarity DESC" 2>/dev/null
@@ -167,6 +220,18 @@ $ vxdb --db ./demo query \
     {"_id": "...", "title": "Attention Is All You Need", "_similarity": 0.44},
     {"_id": "...", "title": "BERT", "_similarity": 0.41}
 ], "count": 3}
+
+# Full SQL — aggregations, OR, DISTINCT
+$ vxdb --db ./demo query "SELECT source, COUNT(*) AS cnt FROM docs GROUP BY source ORDER BY cnt DESC" 2>/dev/null
+{"rows": [
+    {"source": "arxiv", "cnt": 3},
+    {"source": "blog", "cnt": 1},
+    {"source": "openai", "cnt": 1}
+], "count": 3}
+
+# Raw DuckDB SQL — cross-table JOINs via sql tool
+$ vxdb --db ./demo sql "SELECT COUNT(*) AS total FROM lance_ns.main.docs" 2>/dev/null
+{"rows": [{"total": 5}], "count": 1}
 
 # Filter-only query (no vector search, no _similarity)
 $ vxdb --db ./demo query "SELECT title, year FROM docs WHERE year >= 2019 ORDER BY year DESC" 2>/dev/null
@@ -193,19 +258,20 @@ Measured on a single core (x86_64, WSL2), default model (`BAAI/bge-small-en-v1.5
 
 | Operation | Latency |
 |-----------|---------|
-| Cold start (model load) | ~160ms |
-| Embed single text | ~3ms |
-| Insert 1 row (with embedding) | ~14ms |
-| Insert 100 rows (batch) | ~153ms (~1.5ms/row) |
-| Insert 1000 rows (batch) | ~1.5s (~1.5ms/row) |
-| NEAR() query (1K rows) | ~14ms |
-| Filter-only query (1K rows) | ~4ms |
+| Cold start (model load) | ~200ms |
+| Embed single text | ~2ms |
+| Insert 1 row (with embedding) | ~7ms |
+| Insert 100 rows (batch) | ~98ms (~1ms/row) |
+| Insert 1000 rows (batch) | ~1.1s (~1.1ms/row) |
+| NEAR() query (1K rows) | ~16ms |
+| SEARCH() query (1K rows) | ~10ms |
+| Filter-only query (1K rows) | ~3ms |
+| Aggregation query (1K rows) | ~8ms |
+| Raw `sql` COUNT (1K rows) | ~1ms |
 
-Insert is dominated by embedding time. Batch inserts amortize well. Query latency is stable up to low thousands of rows. Performance will degrade on larger tables — there's no index tuning in v1 (LanceDB defaults only). For tables under 100K rows, everything should feel instant over MCP.
+Insert is dominated by embedding time. Batch inserts amortize well. Query latency is stable up to low thousands of rows. For tables under 100K rows, everything should feel instant over MCP.
 
 ## Limits and Non-Goals
-
-Be explicit about what this is and isn't.
 
 ### What vxdb is
 
@@ -217,9 +283,8 @@ Be explicit about what this is and isn't.
 
 - **Not a production database.** No transactions, no WAL, no crash recovery guarantees beyond what LanceDB provides. If the process dies mid-write, data may be partially written.
 - **Not concurrent.** One process at a time. No connection pooling, no multi-writer. Running two vxdb instances on the same `--db` directory will corrupt data.
-- **Not a full SQL engine.** No JOINs, no subqueries, no OR, no GROUP BY. See [Query Dialect](#query-dialect) for the exact surface.
 - **No schema migrations.** Changing a table's schema means drop and recreate. Column types are fixed at creation.
-- **No index tuning.** Vector search uses LanceDB's default flat/IVF strategy. No knobs for IVF-PQ, HNSW, or custom index parameters in v1.
+- **No index tuning.** Vector search uses LanceDB's default flat/IVF strategy. No knobs for IVF-PQ, HNSW, or custom index parameters.
 - **No embedding model hot-swap.** The model is chosen at server start. Changing models means re-embedding all data (the stored vectors become meaningless with a different model).
 - **No auth.** Anyone who can reach the MCP server can read/write everything. Same trust model as SQLite.
 
@@ -231,7 +296,6 @@ Be explicit about what this is and isn't.
 | Process killed mid-insert | Partial write possible. LanceDB uses append-only storage, so existing data is safe. The incomplete batch is lost. |
 | Disk full | LanceDB write fails. Error returned to agent. Existing data intact. |
 | Embedding model download fails | Server won't start. fastembed caches models in `~/.cache/fastembed/`. |
-| Query references nonexistent column | Parse error returned (if NEAR column) or LanceDB filter error (if WHERE column). |
 | Schema sidecar deleted | Table exists in LanceDB but vxdb doesn't know its schema. `list_tables` won't show it. Recreate the sidecar or drop/recreate the table. |
 
 ### Embedding re-computation
@@ -248,4 +312,4 @@ The comparison to SQLite is about **deployment model**, not feature parity:
 - Zero config, not infrastructure
 - Single-user, not multi-tenant
 
-It does **not** mean: ACID transactions, mature query optimizer, decades of battle-testing, or the SQLite test suite. vxdb is a v0.1 with a 244-line SQL parser. Set expectations accordingly.
+It does **not** mean: ACID transactions, mature query optimizer, decades of battle-testing, or the SQLite test suite. Set expectations accordingly.

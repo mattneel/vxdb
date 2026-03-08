@@ -1,10 +1,11 @@
-"""Storage engine wrapping LanceDB for vxdb."""
+"""Storage engine for vxdb — DuckDB + Lance extension for reads,
+LanceDB Python API for writes (insert, update, delete, table lifecycle)."""
 
 import uuid
 from typing import Callable
 
+import duckdb
 import lancedb
-import pyarrow as pa
 
 from vxdb.schema import (
     TableSchema,
@@ -14,12 +15,24 @@ from vxdb.schema import (
     save_schema,
 )
 
+NAMESPACE = "lance_ns"
+
 
 class Storage:
     def __init__(self, db_dir: str, vector_dim: int):
         self.db_dir = db_dir
         self.vector_dim = vector_dim
-        self.db = lancedb.connect(db_dir)
+
+        # LanceDB for all writes + table lifecycle
+        self.lancedb = lancedb.connect(db_dir)
+
+        # DuckDB for reads (queries via lance_vector_search, lance_fts, plain SQL)
+        self.conn = duckdb.connect()
+        self.conn.execute("INSTALL lance FROM community")
+        self.conn.execute("LOAD lance")
+        self.conn.execute(f"ATTACH '{db_dir}' AS {NAMESPACE} (TYPE LANCE)")
+
+        # Schema sidecars for text:embed tracking
         self.schemas: dict[str, TableSchema] = load_all_schemas(db_dir)
 
     def create_table(self, schema: TableSchema) -> None:
@@ -28,7 +41,7 @@ class Storage:
             raise ValueError(f"Table {schema.name!r} already exists.")
 
         arrow_schema = build_arrow_schema(schema, self.vector_dim)
-        self.db.create_table(schema.name, schema=arrow_schema)
+        self.lancedb.create_table(schema.name, schema=arrow_schema)
         save_schema(self.db_dir, schema)
         self.schemas[schema.name] = schema
 
@@ -57,97 +70,27 @@ class Storage:
             for row, vec in zip(rows, vectors):
                 row[f"_vec_{col}"] = vec
 
-        tbl = self.db.open_table(table)
+        tbl = self.lancedb.open_table(table)
         tbl.add(rows)
 
         return len(rows), ids
 
-    def search(
-        self,
-        table: str,
-        vector: list[float],
-        vec_column: str,
-        where: str | None = None,
-        columns: list[str] | None = None,
-        k: int = 10,
-        limit: int | None = None,
-    ) -> list[dict]:
-        """Vector similarity search."""
-        if table not in self.schemas:
-            raise ValueError(f"Table {table!r} does not exist.")
+    def execute(self, sql: str) -> list[dict]:
+        """Execute a read query via DuckDB and return results as list of dicts.
 
-        tbl = self.db.open_table(table)
-        query = tbl.search(vector, vector_column_name=f"_vec_{vec_column}")
-
-        if where:
-            query = query.where(where)
-
-        if columns:
-            # Always include _id in selected columns
-            select_cols = list(set(["_id"] + columns))
-            query = query.select(select_cols)
-
-        query = query.limit(k if limit is None else limit)
-        results = query.to_list()
-
-        # Clean results: remove internal columns, convert _distance to _similarity
-        cleaned = []
-        for row in results:
-            clean_row = {}
-            for key, value in row.items():
-                if key.startswith("_vec_") or key == "vector":
-                    continue
-                if key == "_distance":
-                    clean_row["_similarity"] = 1.0 / (1.0 + value)
-                else:
-                    clean_row[key] = value
-            cleaned.append(clean_row)
-
-        return cleaned
-
-    def filter(
-        self,
-        table: str,
-        where: str | None = None,
-        columns: list[str] | None = None,
-        limit: int | None = None,
-        order_by: list[tuple[str, str]] | None = None,
-    ) -> list[dict]:
-        """Metadata-only query (no vector search)."""
-        if table not in self.schemas:
-            raise ValueError(f"Table {table!r} does not exist.")
-
-        tbl = self.db.open_table(table)
-        query = tbl.search()
-
-        if where:
-            query = query.where(where, prefilter=True)
-
-        if columns:
-            select_cols = list(set(["_id"] + columns))
-            query = query.select(select_cols)
-
-        # Use a generous default limit for non-vector scans
-        query = query.limit(limit if limit is not None else 10_000)
-        rows = query.to_list()
-
-        # Strip internal _vec_ columns and _distance (artifact of search())
-        cleaned = []
-        for row in rows:
-            clean_row = {
-                k: v
-                for k, v in row.items()
-                if not k.startswith("_vec_") and k != "_distance" and k != "vector"
-            }
-            cleaned.append(clean_row)
-
-        # Apply ordering if specified
-        if order_by:
-            for col, direction in reversed(order_by):
-                reverse = direction.upper() == "DESC"
-                cleaned.sort(key=lambda r: r.get(col, ""), reverse=reverse)
-
-        return cleaned
+        Strips internal _vec_* columns from results.
+        """
+        result = self.conn.execute(sql)
+        if result.description is None:
+            return []
+        columns = [desc[0] for desc in result.description]
+        rows = []
+        for row in result.fetchall():
+            d = dict(zip(columns, row))
+            # Strip internal vector columns
+            d = {k: v for k, v in d.items() if not k.startswith("_vec_")}
+            rows.append(d)
+        return rows
 
     def update(
         self,
@@ -156,12 +99,16 @@ class Storage:
         values: dict,
         embed_fn: Callable[[list[str]], list[list[float]]],
     ) -> int:
-        """Update rows matching the filter with new values."""
+        """Update rows matching the filter with new values.
+
+        Uses LanceDB Python API for writes (DuckDB Lance extension has bugs
+        with vector column updates).
+        """
         if table not in self.schemas:
             raise ValueError(f"Table {table!r} does not exist.")
 
         schema = self.schemas[table]
-        tbl = self.db.open_table(table)
+        tbl = self.lancedb.open_table(table)
 
         # Count affected rows before update
         count = tbl.count_rows(filter=where)
@@ -169,30 +116,28 @@ class Storage:
         if count == 0:
             return 0
 
-        # Check if any embed columns are being updated
-        embed_updates: dict[str, str] = {}
+        # Check if any embed columns are being updated — re-embed if so
         for col in schema.embed_columns:
             if col in values:
-                embed_updates[col] = values[col]
-
-        # If embed columns are updated, recompute vectors
-        if embed_updates:
-            # Re-embed and include vectors in the update
-            for col, text in embed_updates.items():
-                vectors = embed_fn([text])
+                vectors = embed_fn([values[col]])
                 values[f"_vec_{col}"] = vectors[0]
 
         tbl.update(where=where, values=values)
         return count
 
     def delete(self, table: str, where: str) -> int:
-        """Delete rows matching the filter."""
+        """Delete rows matching the filter.
+
+        Uses LanceDB Python API for deletes (DuckDB Lance extension has a bug
+        where DELETE removes all rows regardless of WHERE clause).
+        """
         if table not in self.schemas:
             raise ValueError(f"Table {table!r} does not exist.")
 
-        tbl = self.db.open_table(table)
+        tbl = self.lancedb.open_table(table)
         count = tbl.count_rows(filter=where)
-        tbl.delete(where)
+        if count > 0:
+            tbl.delete(where)
         return count
 
     def list_tables(self) -> list[str]:
@@ -204,6 +149,6 @@ class Storage:
         if name not in self.schemas:
             raise ValueError(f"Table {name!r} does not exist.")
 
-        self.db.drop_table(name)
+        self.lancedb.drop_table(name)
         delete_schema(self.db_dir, name)
         del self.schemas[name]

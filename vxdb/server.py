@@ -29,16 +29,25 @@ When working with tool results, write down any important information you might n
 ## Schema Types
 string, text, int, float, bool, text:embed
 
-## Query Language
-SQL subset: SELECT columns FROM table WHERE filters ORDER BY col ASC/DESC LIMIT n
-- NEAR(column, 'search text', k) in WHERE — vector similarity search, returns k nearest neighbors
-- _similarity — virtual column in results when NEAR() is used, available for ORDER BY
-- Operators: =, !=, >, <, >=, <=, IN, LIKE
-- Multiple filters with AND
+## Two Query Tools
+
+### query — single-table, with NEAR()/SEARCH() sugar
+- NEAR(column, 'search text', k) — vector similarity search (embeds text server-side)
+- SEARCH(column, 'search text', k) — full-text search (no embedding needed)
+- _similarity — virtual column when NEAR() is used
+- _score — virtual column when SEARCH() is used
+- Full SQL: OR, NOT, GROUP BY, COUNT, DISTINCT, subqueries all work
+- One NEAR() or one SEARCH() per query (not both)
+
+### sql — raw DuckDB SQL, no rewriting
+- For JOINs, cross-table queries, aggregations, analytics
+- Tables referenced as lance_ns.main.<table_name>
+- Use lance_vector_search(), lance_fts(), lance_hybrid_search() directly
+- No NEAR()/SEARCH() sugar — this is the power user escape hatch
 
 ## Rules
 - _similarity only exists when NEAR() is present. ORDER BY _similarity without NEAR() is an error.
-- One NEAR() per query.
+- One NEAR() or one SEARCH() per query (not both). For hybrid, use sql tool with lance_hybrid_search().
 - NEAR() column must be text:embed type.
 - update/delete accept either "where" (filter string) or "id" (_id value), not both.
 - Empty results return [], not an error.
@@ -51,13 +60,14 @@ _tools: Tools | None = None
 GUIDE = """\
 # vxdb Guide
 
-Vectorized database over MCP. SQLite for vectors.
+Vectorized database over MCP. SQLite for vectors. Powered by DuckDB + Lance.
 
 ## Concepts
 
 vxdb is an embedded vector database exposed as MCP tools. You talk to it like a SQL \
-database, but it understands semantic similarity via the NEAR() function. Embeddings \
-are computed server-side — you send text, it handles vectorization.
+database, but it understands semantic similarity via the NEAR() function and full-text \
+search via the SEARCH() function. Embeddings are computed server-side — you send text, \
+it handles vectorization.
 
 ## Tables & Schema
 
@@ -73,14 +83,14 @@ Create tables with typed columns:
     })
 
 ### Types
-| Type        | Description                                        |
-|-------------|----------------------------------------------------|
-| string      | UTF-8 text, not embedded                           |
-| text        | Alias for string                                   |
-| text:embed  | Text that gets automatically embedded for NEAR()   |
-| int         | 64-bit integer                                     |
-| float       | 64-bit float                                       |
-| bool        | Boolean                                            |
+| Type        | Description                                          |
+|-------------|------------------------------------------------------|
+| string      | UTF-8 text, not embedded                             |
+| text        | Alias for string                                     |
+| text:embed  | Text that gets automatically embedded for NEAR()     |
+| int         | 64-bit integer                                       |
+| float       | 64-bit float                                         |
+| bool        | Boolean                                              |
 
 A table can have multiple text:embed columns. Each gets its own vector index.
 
@@ -95,37 +105,56 @@ A table can have multiple text:embed columns. Each gets its own vector index.
 - Embeddings for text:embed columns are computed automatically on insert.
 - Rows must match the table schema.
 
-## Querying
+## Querying — Two Tools
 
-Full SQL subset: SELECT / FROM / WHERE / ORDER BY / LIMIT
+### query tool (single-table, with sugar)
 
-### Metadata-only queries (no vector search):
+Full SQL with NEAR()/SEARCH() syntactic sugar. Operates on one table.
+
+Metadata-only queries:
 
     query("SELECT * FROM documents")
     query("SELECT title, source FROM documents WHERE priority <= 2")
-    query("SELECT * FROM documents WHERE source IN ('arxiv', 'blog') ORDER BY score DESC LIMIT 5")
+    query("SELECT * FROM documents WHERE source = 'arxiv' OR source = 'blog' ORDER BY score DESC LIMIT 5")
+    query("SELECT category, COUNT(*) AS cnt FROM documents GROUP BY category")
 
-### Vector similarity search with NEAR():
+Vector similarity search with NEAR():
 
     query("SELECT * FROM documents WHERE NEAR(body, 'transformer architecture attention', 10)")
     query("SELECT title FROM documents WHERE source = 'arxiv' AND NEAR(body, 'language models', 5) ORDER BY _similarity DESC LIMIT 3")
+
+Full-text search with SEARCH():
+
+    query("SELECT * FROM documents WHERE SEARCH(body, 'neural network architecture', 5)")
+    query("SELECT title FROM documents WHERE source = 'arxiv' AND SEARCH(body, 'attention', 3) ORDER BY _score DESC")
 
 NEAR(column, 'search text', k):
 - column: must be a text:embed column
 - search text: natural language query (embedded at query time)
 - k: number of nearest neighbors to return
+- _similarity: virtual column (0-1, higher = more similar)
 
-### _similarity
-- Virtual column that appears in results ONLY when NEAR() is in the query.
-- Float between 0 and 1 (higher = more similar).
-- Can be used in ORDER BY: ORDER BY _similarity DESC
-- Using _similarity without NEAR() is a parse error.
+SEARCH(column, 'search text', k):
+- column: any text column
+- search text: full-text search query
+- k: number of results to return
+- _score: virtual column (higher = more relevant)
 
-### Operators
-=, !=, >, <, >=, <=, IN ('a', 'b'), LIKE '%pattern%'
+Rules:
+- One NEAR() or one SEARCH() per query (not both)
+- _similarity only exists with NEAR(), _score only exists with SEARCH()
+- Full SQL supported: OR, NOT, GROUP BY, HAVING, DISTINCT, subqueries
 
-Combine filters with AND:
-    WHERE category = 'ml' AND priority > 2 AND NEAR(body, 'search', 5)
+### sql tool (raw DuckDB SQL, no rewriting)
+
+For JOINs, cross-table queries, aggregations, and analytics. No NEAR()/SEARCH() sugar — \
+use DuckDB's native lance_vector_search(), lance_fts(), lance_hybrid_search() directly.
+
+Tables are referenced as lance_ns.main.<table_name>.
+
+    sql("SELECT COUNT(*) FROM lance_ns.main.documents")
+    sql("SELECT n.title, c.name FROM lance_ns.main.notes n JOIN lance_ns.main.categories c ON n.cat_id = c._id")
+    sql("SELECT category, COUNT(*) FROM lance_ns.main.documents GROUP BY category ORDER BY COUNT(*) DESC")
 
 ## Updating
 
@@ -157,12 +186,16 @@ By filter:
     insert("memory", [{"content": "User prefers dark mode", "context": "preferences", "timestamp": "2025-01-01T00:00:00Z"}])
     query("SELECT * FROM memory WHERE NEAR(content, 'UI preferences', 5)")
 
-### Document index
+### Document index with full-text search
     create_table("docs", {"title": "string", "chunk": "text:embed", "path": "string", "page": "int"})
+    query("SELECT * FROM docs WHERE SEARCH(chunk, 'installation guide', 10) ORDER BY _score DESC")
 
 ### Structured logs with semantic search
     create_table("logs", {"message": "text:embed", "level": "string", "service": "string"})
     query("SELECT * FROM logs WHERE level = 'error' AND NEAR(message, 'connection timeout', 10)")
+
+### Cross-table analytics (via sql tool)
+    sql("SELECT l.message, s.name FROM lance_ns.main.logs l JOIN lance_ns.main.services s ON l.service = s._id WHERE l.level = 'error'")
 
 ## CLI (non-MCP)
 
@@ -171,6 +204,7 @@ vxdb also works as a direct CLI tool. All commands output JSON to stdout:
     vxdb --db ./data create-table notes '{"title": "string", "content": "text:embed"}'
     vxdb --db ./data insert notes '[{"title": "Hello", "content": "World"}]'
     vxdb --db ./data query "SELECT * FROM notes WHERE NEAR(content, 'greeting', 5)"
+    vxdb --db ./data sql "SELECT COUNT(*) FROM lance_ns.main.notes"
     vxdb --db ./data update notes '{"title": "Updated"}' --id <uuid>
     vxdb --db ./data delete notes --where "title = 'old'"
     vxdb --db ./data tables
@@ -311,6 +345,29 @@ def drop_table(name: str) -> dict:
     return _get_tools().drop_table(name)
 
 
+@mcp.tool()
+def sql(sql: str) -> dict:
+    """Execute raw DuckDB SQL. No NEAR()/SEARCH() rewriting.
+
+    Use this for JOINs, cross-table queries, aggregations, and analytics.
+    Tables are referenced as lance_ns.main.<table_name>.
+    For vector search, use lance_vector_search() directly.
+    For full-text search, use lance_fts() directly.
+
+    Examples:
+        SELECT COUNT(*) FROM lance_ns.main.notes
+        SELECT n.title, c.name FROM lance_ns.main.notes n JOIN lance_ns.main.categories c ON n.cat_id = c._id
+        SELECT category, COUNT(*) FROM lance_ns.main.notes GROUP BY category
+
+    Args:
+        sql: Raw DuckDB SQL string.
+
+    Returns:
+        Result rows and count.
+    """
+    return _get_tools().sql(sql)
+
+
 def _init(db_dir: str, embedding_model: str) -> None:
     global _tools
     os.makedirs(db_dir, exist_ok=True)
@@ -357,8 +414,11 @@ def main():
     ins.add_argument("table", help="Table name")
     ins.add_argument("rows", help='Rows as JSON array: \'[{"col": "val"}, ...]\'')
 
-    q = sub.add_parser("query", help="Query with SQL")
+    q = sub.add_parser("query", help="Query with SQL (NEAR/SEARCH sugar)")
     q.add_argument("sql", help="SQL query string")
+
+    raw = sub.add_parser("sql", help="Raw DuckDB SQL (no rewriting)")
+    raw.add_argument("sql", help="Raw DuckDB SQL string")
 
     up = sub.add_parser("update", help="Update rows")
     up.add_argument("table", help="Table name")
@@ -399,6 +459,8 @@ def main():
             _json_out(tools.insert(args.table, json.loads(args.rows)))
         case "query":
             _json_out(tools.query(args.sql))
+        case "sql":
+            _json_out(tools.sql(args.sql))
         case "update":
             _json_out(tools.update(args.table, json.loads(args.set), where=args.where, id=args.id))
         case "delete":
