@@ -2,7 +2,7 @@
 
 A local vector store with a SQL interface, exposed over MCP.
 
-In-process embeddings via [fastembed](https://github.com/qdrant/fastembed), query engine via [DuckDB](https://duckdb.org/) + [Lance extension](https://lancedb.github.io/lance/integrations/duckdb.html), storage via [LanceDB](https://lancedb.github.io/lancedb/), exposed through [FastMCP](https://gofastmcp.com). Zero config for the consuming agent — it just talks to a database that happens to understand similarity.
+In-process embeddings via [fastembed](https://github.com/qdrant/fastembed), query engine via [DuckDB](https://duckdb.org/) + [Lance extension](https://lancedb.github.io/lance/integrations/duckdb.html), storage via [LanceDB](https://lancedb.github.io/lancedb/), exposed through [FastMCP](https://gofastmcp.com). Zero config for the client agent — it just talks to a database that happens to understand similarity.
 
 ## Why vxdb
 
@@ -98,7 +98,7 @@ vxdb has two query tools. Use `query` for single-table work with semantic search
 
 ### `query` — single-table, with NEAR()/SEARCH()
 
-Full SQL with `NEAR()` and `SEARCH()` syntactic sugar. Operates on one table at a time.
+SQL `SELECT` queries over a single table, with `NEAR()` and `SEARCH()` syntactic sugar.
 
 ```sql
 -- Metadata queries (full SQL: OR, GROUP BY, DISTINCT, COUNT, subqueries)
@@ -280,7 +280,7 @@ Insert is dominated by embedding time. Batch inserts amortize well. Query latenc
 
 - A **local, single-process, file-based** vector store
 - A **convenience layer** that handles embeddings so agents don't have to
-- **Good enough** for agent memory, document search, semantic caching up to ~100K rows
+- **Good enough** for agent memory, document search, semantic caching at small-to-medium local scale (low tens of thousands of rows)
 
 ### What vxdb is not
 
@@ -296,7 +296,7 @@ Insert is dominated by embedding time. Batch inserts amortize well. Query latenc
 | Scenario | What happens |
 |----------|-------------|
 | Two processes open same `--db` | Unsupported. May corrupt data. Don't do this. |
-| Process killed mid-insert | Partial write possible. LanceDB uses append-only storage, so existing data is safe. The incomplete batch is lost. |
+| Process killed mid-insert | Partial write possible. LanceDB uses append-only storage, so existing committed data should remain intact. The incomplete batch is lost. |
 | Disk full | LanceDB write fails. Error returned to agent. Existing data intact. |
 | Embedding model download fails | Server won't start. fastembed caches models in `~/.cache/fastembed/`. |
 | Schema sidecar deleted | Table exists in LanceDB but vxdb doesn't know its schema. `list_tables` won't show it. Recreate the sidecar or drop/recreate the table. |
@@ -305,7 +305,7 @@ Insert is dominated by embedding time. Batch inserts amortize well. Query latenc
 
 - **On insert:** all `text:embed` columns are embedded automatically.
 - **On update:** if you update a `text:embed` column, its vector is recomputed. If you update a non-embed column, vectors are untouched.
-- **On model change:** existing vectors are NOT re-embedded. If you change `--embedding-model`, old vectors and new query vectors will be from different models. Results will be garbage. Drop and reinsert.
+- **On model change:** existing vectors are NOT re-embedded. If you change `--embedding-model`, old vectors and new query vectors will be from different models. Results will be semantically meaningless. Drop and reinsert.
 
 ### What "SQLite for vectors" means (and doesn't)
 
