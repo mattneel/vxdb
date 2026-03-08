@@ -1,0 +1,18 @@
+[project]
+name = "vxdb"
+version = "0.1.0"
+description = "Vectorized database over MCP. SQLite for vectors."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastmcp",
+    "lancedb",
+    "fastembed",
+]
+
+[project.scripts]
+vxdb = "vxdb.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

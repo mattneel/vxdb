@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "vxdb": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/mattneel/vxdb", "vxdb", "--db", "./data"]
+    }
+  }
+}
