@@ -2,7 +2,7 @@
 
 A local vector store with a SQL interface, exposed over MCP.
 
-Server-side embeddings via [fastembed](https://github.com/qdrant/fastembed), query engine via [DuckDB](https://duckdb.org/) + [Lance extension](https://lancedb.github.io/lance/integrations/duckdb.html), storage via [LanceDB](https://lancedb.github.io/lancedb/), exposed through [FastMCP](https://gofastmcp.com). Zero config for the consuming agent — it just talks to a database that happens to understand similarity.
+In-process embeddings via [fastembed](https://github.com/qdrant/fastembed), query engine via [DuckDB](https://duckdb.org/) + [Lance extension](https://lancedb.github.io/lance/integrations/duckdb.html), storage via [LanceDB](https://lancedb.github.io/lancedb/), exposed through [FastMCP](https://gofastmcp.com). Zero config for the consuming agent — it just talks to a database that happens to understand similarity.
 
 ## Why vxdb
 
@@ -12,8 +12,9 @@ Most agentic memory solutions are either too coupled (framework-specific) or too
 |---|---|---|---|---|---|
 | Embedded (no server) | Yes | Yes | No (client-server) | No (client-server) | Yes |
 | MCP native | Yes | No | No | No | No |
-| Server-side embeddings | Yes | No (BYO vectors) | Yes | No (BYO vectors) | No (BYO vectors) |
-| Full SQL query language | Yes (DuckDB) | Yes (SQLite ext) | No (Python API) | No (REST/gRPC) | No (Python API) |
+| In-process embeddings | Yes | No (BYO vectors) | Yes | No (BYO vectors) | No (BYO vectors) |
+| Single-table semantic SQL | Yes (`query` tool) | No | No | No | No |
+| Raw SQL access | Yes (`sql` tool, DuckDB) | Yes (SQLite ext) | No (Python API) | No (REST/gRPC) | No (Python API) |
 | Vector + full-text search | Yes | Limited | Yes | Yes | Yes |
 | JOINs, aggregations | Yes (via `sql` tool) | Yes | No | No | No |
 | Zero config | Yes | Yes | No (needs setup) | No (needs setup) | Yes |
@@ -118,7 +119,7 @@ SELECT title FROM notes WHERE SEARCH(content, 'attention', 3) ORDER BY _score DE
 
 **NEAR(column, 'text', k)** — semantic similarity search:
 - `column` must be a `text:embed` column
-- `text` is embedded server-side at query time
+- `text` is embedded in-process at query time
 - `k` nearest neighbors returned
 - `_similarity` virtual column (0-1, higher = more similar)
 
@@ -157,6 +158,8 @@ Agent ──MCP──▶ FastMCP ──▶ Tools ──▶ rewriter ──▶ Du
 **Reads** go through DuckDB with the Lance extension. DuckDB provides the SQL parser, query planner, and execution engine. The rewriter transforms `NEAR()`/`SEARCH()` sugar into DuckDB-native `lance_vector_search()`/`lance_fts()` table functions.
 
 **Writes** (insert, update, delete, table lifecycle) go through the LanceDB Python API for reliability and performance.
+
+**Schema sidecars**: Each table's schema (column names, types, which columns are `text:embed`) is stored as a JSON file alongside the Lance data in the `--db` directory. These sidecars are the source of truth for vxdb's type system — if a sidecar is deleted, vxdb loses track of the table even though the Lance data still exists on disk.
 
 ### Schema types
 
@@ -243,7 +246,7 @@ $ vxdb --db ./demo query "SELECT title, year FROM docs WHERE year >= 2019 ORDER 
 
 # Update — re-embeds automatically when text:embed column changes
 $ vxdb --db ./demo update docs '{"source": "classic"}' --where "year < 2019" 2>/dev/null
-{"count": 1}
+{"count": 2}
 
 # Persistence — reopen the same --db directory, data is still there
 $ vxdb --db ./demo tables 2>/dev/null
@@ -254,7 +257,7 @@ $ vxdb --db ./demo query "SELECT title FROM docs" 2>/dev/null
 
 ## Performance
 
-Measured on a single core (x86_64, WSL2), default model (`BAAI/bge-small-en-v1.5`, 384 dims), Python 3.14:
+Measured on a single core (x86_64, WSL2), default model (`BAAI/bge-small-en-v1.5`, 384 dims), Python 3.14. All query numbers are warm-cache averages over 10 runs. LanceDB defaults (no custom ANN index config).
 
 | Operation | Latency |
 |-----------|---------|
@@ -269,7 +272,7 @@ Measured on a single core (x86_64, WSL2), default model (`BAAI/bge-small-en-v1.5
 | Aggregation query (1K rows) | ~8ms |
 | Raw `sql` COUNT (1K rows) | ~1ms |
 
-Insert is dominated by embedding time. Batch inserts amortize well. Query latency is stable up to low thousands of rows. For tables under 100K rows, everything should feel instant over MCP.
+Insert is dominated by embedding time. Batch inserts amortize well. Query latency is stable up to low thousands of rows with default LanceDB indexing. Not benchmarked beyond 10K rows — expect degradation at scale without index tuning (which vxdb doesn't expose).
 
 ## Limits and Non-Goals
 
@@ -282,7 +285,7 @@ Insert is dominated by embedding time. Batch inserts amortize well. Query latenc
 ### What vxdb is not
 
 - **Not a production database.** No transactions, no WAL, no crash recovery guarantees beyond what LanceDB provides. If the process dies mid-write, data may be partially written.
-- **Not concurrent.** One process at a time. No connection pooling, no multi-writer. Running two vxdb instances on the same `--db` directory will corrupt data.
+- **Not concurrent.** One process at a time. No connection pooling, no multi-writer. Running two vxdb instances on the same `--db` directory is unsupported and may corrupt data.
 - **No schema migrations.** Changing a table's schema means drop and recreate. Column types are fixed at creation.
 - **No index tuning.** Vector search uses LanceDB's default flat/IVF strategy. No knobs for IVF-PQ, HNSW, or custom index parameters.
 - **No embedding model hot-swap.** The model is chosen at server start. Changing models means re-embedding all data (the stored vectors become meaningless with a different model).
@@ -292,7 +295,7 @@ Insert is dominated by embedding time. Batch inserts amortize well. Query latenc
 
 | Scenario | What happens |
 |----------|-------------|
-| Two processes open same `--db` | Undefined behavior. Likely corruption. Don't do this. |
+| Two processes open same `--db` | Unsupported. May corrupt data. Don't do this. |
 | Process killed mid-insert | Partial write possible. LanceDB uses append-only storage, so existing data is safe. The incomplete batch is lost. |
 | Disk full | LanceDB write fails. Error returned to agent. Existing data intact. |
 | Embedding model download fails | Server won't start. fastembed caches models in `~/.cache/fastembed/`. |
