@@ -10,7 +10,7 @@ Embedded vector database that any MCP-speaking agent can use. Server-side embedd
 uvx --from git+https://github.com/mattneel/vxdb vxdb --db ./data
 ```
 
-## Setup
+## MCP Setup
 
 ```json
 {
@@ -23,7 +23,7 @@ uvx --from git+https://github.com/mattneel/vxdb vxdb --db ./data
 }
 ```
 
-## Usage
+## MCP Tools
 
 Seven tools, mirroring SQLite's surface:
 
@@ -51,8 +51,36 @@ drop_table("notes")
 
 ## CLI
 
+Also works as a direct CLI tool for agents without MCP (or humans):
+
+```sh
+# MCP server (default — no subcommand)
+vxdb --db ./data
+vxdb --db ./data serve --transport sse
+
+# Create table
+vxdb --db ./data create-table notes '{"title": "string", "content": "text:embed", "category": "string"}'
+
+# Insert rows
+vxdb --db ./data insert notes '[{"title": "ML Paper", "content": "Transformers for NLP", "category": "ml"}]'
+
+# Query (with NEAR for vector search)
+vxdb --db ./data query "SELECT * FROM notes WHERE NEAR(content, 'deep learning', 5) ORDER BY _similarity DESC"
+
+# Update by id or filter
+vxdb --db ./data update notes '{"category": "archive"}' --id some-uuid
+vxdb --db ./data update notes '{"category": "archive"}' --where "category = 'old'"
+
+# Delete
+vxdb --db ./data delete notes --id some-uuid
+vxdb --db ./data delete notes --where "category = 'archive'"
+
+# List tables / drop
+vxdb --db ./data tables
+vxdb --db ./data drop-table notes
+
+# Custom embedding model
+vxdb --db ./data --embedding-model BAAI/bge-base-en-v1.5 query "SELECT * FROM notes"
 ```
-vxdb --db ./data                                    # stdio (default)
-vxdb --db ./data --transport sse                    # HTTP/SSE server
-vxdb --db ./data --embedding-model BAAI/bge-base-en-v1.5  # custom model
-```
+
+All commands output JSON to stdout. Logs go to stderr.

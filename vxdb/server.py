@@ -163,6 +163,18 @@ By filter:
 ### Structured logs with semantic search
     create_table("logs", {"message": "text:embed", "level": "string", "service": "string"})
     query("SELECT * FROM logs WHERE level = 'error' AND NEAR(message, 'connection timeout', 10)")
+
+## CLI (non-MCP)
+
+vxdb also works as a direct CLI tool. All commands output JSON to stdout:
+
+    vxdb --db ./data create-table notes '{"title": "string", "content": "text:embed"}'
+    vxdb --db ./data insert notes '[{"title": "Hello", "content": "World"}]'
+    vxdb --db ./data query "SELECT * FROM notes WHERE NEAR(content, 'greeting', 5)"
+    vxdb --db ./data update notes '{"title": "Updated"}' --id <uuid>
+    vxdb --db ./data delete notes --where "title = 'old'"
+    vxdb --db ./data tables
+    vxdb --db ./data drop-table notes
 """
 
 
@@ -310,6 +322,11 @@ def _init(db_dir: str, embedding_model: str) -> None:
     _tools = Tools(storage, embedder)
 
 
+def _json_out(data):
+    import json
+    print(json.dumps(data, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="vxdb",
@@ -321,16 +338,75 @@ def main():
         default="BAAI/bge-small-en-v1.5",
         help="Embedding model name (default: BAAI/bge-small-en-v1.5)",
     )
-    parser.add_argument(
-        "--transport",
-        choices=["stdio", "sse"],
-        default="stdio",
+
+    sub = parser.add_subparsers(dest="command")
+
+    # MCP server (default when no subcommand)
+    serve_cmd = sub.add_parser("serve", help="Start MCP server (default)")
+    serve_cmd.add_argument(
+        "--transport", choices=["stdio", "sse"], default="stdio",
         help="MCP transport (default: stdio)",
     )
 
+    # CLI subcommands
+    ct = sub.add_parser("create-table", help="Create a table")
+    ct.add_argument("name", help="Table name")
+    ct.add_argument("schema", help='Column schema as JSON: \'{"col": "type", ...}\'')
+
+    ins = sub.add_parser("insert", help="Insert rows")
+    ins.add_argument("table", help="Table name")
+    ins.add_argument("rows", help='Rows as JSON array: \'[{"col": "val"}, ...]\'')
+
+    q = sub.add_parser("query", help="Query with SQL")
+    q.add_argument("sql", help="SQL query string")
+
+    up = sub.add_parser("update", help="Update rows")
+    up.add_argument("table", help="Table name")
+    up.add_argument("set", help='Values as JSON: \'{"col": "val"}\'')
+    up_target = up.add_mutually_exclusive_group(required=True)
+    up_target.add_argument("--where", help="Filter string")
+    up_target.add_argument("--id", help="Row _id")
+
+    dl = sub.add_parser("delete", help="Delete rows")
+    dl.add_argument("table", help="Table name")
+    dl_target = dl.add_mutually_exclusive_group(required=True)
+    dl_target.add_argument("--where", help="Filter string")
+    dl_target.add_argument("--id", help="Row _id")
+
+    sub.add_parser("tables", help="List tables")
+
+    dt = sub.add_parser("drop-table", help="Drop a table")
+    dt.add_argument("name", help="Table name")
+
     args = parser.parse_args()
+
+    # No subcommand or "serve" → MCP server
+    if args.command is None or args.command == "serve":
+        transport = getattr(args, "transport", "stdio")
+        _init(args.db, args.embedding_model)
+        mcp.run(transport=transport)
+        return
+
+    # CLI mode
+    import json
     _init(args.db, args.embedding_model)
-    mcp.run(transport=args.transport)
+    tools = _get_tools()
+
+    match args.command:
+        case "create-table":
+            _json_out(tools.create_table(args.name, json.loads(args.schema)))
+        case "insert":
+            _json_out(tools.insert(args.table, json.loads(args.rows)))
+        case "query":
+            _json_out(tools.query(args.sql))
+        case "update":
+            _json_out(tools.update(args.table, json.loads(args.set), where=args.where, id=args.id))
+        case "delete":
+            _json_out(tools.delete(args.table, where=args.where, id=args.id))
+        case "tables":
+            _json_out(tools.list_tables())
+        case "drop-table":
+            _json_out(tools.drop_table(args.name))
 
 
 if __name__ == "__main__":
