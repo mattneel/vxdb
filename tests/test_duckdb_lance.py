@@ -23,7 +23,7 @@ def lance_dir(tmp_path):
 def conn(lance_dir):
     """DuckDB connection with Lance extension attached."""
     c = duckdb.connect()
-    c.execute("INSTALL lance FROM community")
+    c.execute("INSTALL lance")
     c.execute("LOAD lance")
     c.execute(f"ATTACH '{lance_dir}' AS lance_ns (TYPE LANCE)")
     return c
