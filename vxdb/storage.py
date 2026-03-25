@@ -28,7 +28,7 @@ class Storage:
 
         # DuckDB for reads (queries via lance_vector_search, lance_fts, plain SQL)
         self.conn = duckdb.connect()
-        self.conn.execute("INSTALL lance FROM community")
+        self.conn.execute("INSTALL lance")
         self.conn.execute("LOAD lance")
         self.conn.execute(f"ATTACH '{db_dir}' AS {NAMESPACE} (TYPE LANCE)")
 
